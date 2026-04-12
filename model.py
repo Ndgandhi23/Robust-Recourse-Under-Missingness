@@ -1,10 +1,13 @@
+import warnings
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 
 
 def train(Phi_train, y_train, C=1.0):
     model = LogisticRegression(C=C, max_iter=1000, solver="lbfgs")
-    model.fit(Phi_train, y_train)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        model.fit(Phi_train, y_train)
     theta_hat = np.append(model.coef_[0], model.intercept_[0])
     return theta_hat, model
 
@@ -17,11 +20,13 @@ def compute_hessian(Phi_train, theta_hat, gamma=1e-3):
 
     # hessian of logistic loss: H = (1/n) * Phi^T W Phi
     # where W = diag(p_i * (1 - p_i))
-    raw_scores   = Phi_aug @ theta_hat
-    probs        = 1.0 / (1.0 + np.exp(-raw_scores))
-    hessian_weights = probs * (1.0 - probs)
-
-    hessian_matrix = (Phi_aug.T * hessian_weights) @ Phi_aug / n
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+            raw_scores      = np.clip(Phi_aug @ theta_hat, -500, 500)
+            probs           = 1.0 / (1.0 + np.exp(-raw_scores))
+            hessian_weights = probs * (1.0 - probs)
+            hessian_matrix  = (Phi_aug.T * hessian_weights) @ Phi_aug / n
     hessian_matrix += gamma * np.eye(hessian_matrix.shape[0])  # damp for invertibility
 
     return hessian_matrix
@@ -30,7 +35,10 @@ def compute_hessian(Phi_train, theta_hat, gamma=1e-3):
 def score(Phi, theta_hat):
     n = Phi.shape[0]
     Phi_aug = np.hstack([Phi, np.ones((n, 1))])
-    return Phi_aug @ theta_hat
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+            return Phi_aug @ theta_hat
 
 
 def predict(Phi, theta_hat, tau=0.0):

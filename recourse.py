@@ -107,7 +107,10 @@ def solve_delta(x0, xi0, r, theta_hat, hessian_matrix, mu, Sigma, epsilon, rho,
     term0 = theta_hat @ v
     term1 = np.sqrt(2 * epsilon) * cp.norm(H_inv_sqrt @ v, 2)
 
-    robust_constraint = term0 - term1 - const_term2 - const_term3 >= tau
+    # Add a small margin so the solver's boundary-tolerance gap doesn't cause
+    # re-evaluation failures: CLARABEL's ~1e-7 primal tolerance can place
+    # "optimal" solutions just below the constraint boundary when checked in numpy.
+    robust_constraint = term0 - term1 - const_term2 - const_term3 >= tau + 1e-4
 
     constraints = [robust_constraint]
 

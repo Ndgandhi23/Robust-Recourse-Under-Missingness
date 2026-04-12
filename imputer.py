@@ -1,3 +1,4 @@
+import warnings
 import numpy as np
 from sklearn.experimental import enable_iterative_imputer  # noqa
 from sklearn.impute import IterativeImputer
@@ -15,7 +16,9 @@ def fit_mice(X_train, Xi_train, max_iter=10, seed=42):
         sample_posterior=True,  # Gaussian posterior draws for uncertainty estimation
         random_state=seed
     )
-    imputer.fit(X_nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        imputer.fit(X_nan)
     return imputer
 
 
@@ -33,7 +36,9 @@ def get_mice_draws(imputer, x0, xi_c, K=200, seed=42):
         x_nan[xi_c == 1] = np.nan
 
         imputer.random_state_ = np.random.RandomState(rng.randint(0, 100000))
-        x_imputed = imputer.transform(x_nan.reshape(1, -1))[0]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            x_imputed = imputer.transform(x_nan.reshape(1, -1))[0]
         draws[k]  = x_imputed[miss_idx]
 
     return draws
@@ -45,6 +50,24 @@ def compute_mu_sigma(draws, eta=1e-4):
     Sigma = np.atleast_2d(np.cov(draws.T))
     Sigma += eta * np.eye(d_miss)  # ridge for invertibility
     return mu, Sigma
+
+
+def calibrate_rho(draws, mu, Sigma, coverage=0.90):
+    """
+    Empirical `coverage`-quantile of Mahalanobis distances of MICE draws.
+
+    Returns the rho such that `coverage` fraction of draws fall inside the
+    ellipsoid {x: (x-mu)^T Sigma^{-1} (x-mu) <= rho^2}.
+    """
+    K, d_miss = draws.shape
+    if d_miss == 0 or K <= 1:
+        return 0.0
+    Sigma_inv = np.linalg.inv(Sigma)
+    diffs     = draws - mu
+    mahal     = np.sqrt(np.maximum(
+        np.einsum('ki,ij,kj->k', diffs, Sigma_inv, diffs), 0.0
+    ))
+    return float(np.quantile(mahal, coverage))
 
 
 def get_imputation_params(imputer, x0, xi_c, K=200, seed=42):

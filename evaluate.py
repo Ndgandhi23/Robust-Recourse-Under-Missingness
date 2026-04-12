@@ -1,7 +1,9 @@
+import warnings
 import numpy as np
+from sklearn.neighbors import LocalOutlierFactor
 from data    import build_phi
 from model   import train, score
-
+from recourse import compute_A_b, worst_case_lower_bound
 
 def _recourse_point(x0, delta, xi0, r, mu):
     """Post-action feature vector with mu plugged into still-missing entries."""
@@ -13,7 +15,14 @@ def _recourse_point(x0, delta, xi0, r, mu):
     return x_rec, xi_c
 
 
-def random_retrain_validity(
+def nominal_validity(theta_hat, x0, delta, xi0, r, mu, tau=0.0):
+    """Returns True if the recourse flips the decision under the trained model."""
+    x_rec, xi_c = _recourse_point(x0, delta, xi0, r, mu)
+    phi_rec     = build_phi(x_rec.reshape(1, -1), xi_c.reshape(1, -1))
+    return bool(score(phi_rec, theta_hat)[0] >= tau)
+
+
+def model_retrain_validity(
     X_train, Xi_train, y_train,
     x0, delta, xi0, r, mu,
     tau=0.0, n_models=50, seed=0,
@@ -31,78 +40,159 @@ def random_retrain_validity(
     for _ in range(n_models):
         idx    = rng.choice(n, size=n, replace=True)
         Phi_b  = build_phi(X_train[idx], Xi_train[idx])
-        theta_b, _ = train(Phi_b, y_train[idx])
-        if score(phi_rec, theta_b)[0] >= tau:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            theta_b, _ = train(Phi_b, y_train[idx])
+        s = score(phi_rec, theta_b)[0]
+        if np.isfinite(s) and s >= tau:
             valid += 1
 
     return valid / n_models
 
 
-def rashomon_dropout_validity(
-    theta_hat,
-    x0, delta, xi0, r, mu,
-    dropout_rate=0.1, n_samples=200, tau=0.0, seed=0,
-):
-    """
-    Rashomon Dropout (Hsu et al.). Apply random binary dropout masks to
-    theta_hat at inference time — each thinned subnetwork approximates a
-    member of the Rashomon set. Returns fraction of masked models for which
-    the recourse action achieves score >= tau.
-
-    For linear models: randomly zero out weight components, rescale to
-    preserve expected value.
-    """
-    rng = np.random.RandomState(seed)
-    p   = len(theta_hat)
-    x_rec, xi_c = _recourse_point(x0, delta, xi0, r, mu)
-    phi_rec     = build_phi(x_rec.reshape(1, -1), xi_c.reshape(1, -1))
-    phi_aug     = np.append(phi_rec[0], 1.0)
-
-    valid = 0
-    for _ in range(n_samples):
-        mask          = (rng.uniform(0, 1, p) > dropout_rate).astype(float)
-        theta_thinned = theta_hat * mask / (1.0 - dropout_rate)  # rescale
-        if phi_aug @ theta_thinned >= tau:
-            valid += 1
-
-    return valid / n_samples
 
 
 def awp_validity(
     theta_hat, hessian_matrix,
-    x0, delta, xi0, r, mu,
-    epsilon, tau=0.0,
+    x0, delta, xi0, r, mu, Sigma,
+    epsilon_eval, rho_eval, tau=0.0,
 ):
     """
-    Adversarial Weight Perturbation. Finds the worst-case theta within
-    R_ellip(epsilon) for this specific recourse point using the closed form:
+    Joint adversarial worst-case over both the Rashomon ellipsoid (model
+    uncertainty) and the imputation ellipsoid (missingness uncertainty).
 
-        theta_adv = theta_hat - sqrt(2*eps) * H^{-1} phi / sqrt(phi^T H^{-1} phi)
+    Computes the closed-form lower bound from Proposition 2:
+        LB = theta_hat^T v
+             - sqrt(2*eps) * ||H^{-1/2} v||
+             - rho         * ||Sigma^{1/2} A^T theta_hat||
+             - sqrt(2*eps) * rho * ||H^{-1/2} A Sigma^{1/2}||
+    where v = A @ mu + b.
 
-    Returns (passes: bool, adversarial_score: float).
-    Always passes for our method by construction — useful for evaluating baselines.
+    Call twice:
+      - epsilon_eval = epsilon_opt, rho_eval = rho_opt  -> sanity check,
+        should always pass by construction if the solver succeeded.
+      - epsilon_eval > epsilon_opt, rho_eval > rho_opt  -> out-of-sample
+        stress test; failure here is meaningful.
+
+    Returns (passes: bool, lower_bound: float).
+    """
+    A, b, _ = compute_A_b(x0, xi0, delta, r)
+    lb = worst_case_lower_bound(
+        theta_hat, hessian_matrix, A, b, mu, Sigma,
+        epsilon_eval, rho_eval,
+    )
+    return bool(lb >= tau), float(lb)
+
+
+def lof_plausibility(X_train, Xi_train, mice_imputer, x0, delta, xi0, r, mu,
+                     n_neighbors=20, K=20, seed=0):
+    """
+    Local Outlier Factor plausibility score for a recourse point.
+
+    Fits LOF on MICE-imputed training data (K draws averaged) so the training
+    distribution matches the convention used for x_rec (missing entries filled
+    with MICE conditional means).
+    Returns a value >= 1; scores close to 1 indicate the recourse point lies
+    in a realistic, high-density region. Larger values mean the point is an
+    outlier relative to the training distribution.
+    """
+    x_rec, _ = _recourse_point(x0, delta, xi0, r, mu)
+
+    # impute training data: K draws on the full matrix, then average
+    rng   = np.random.RandomState(seed)
+    X_nan = X_train.copy().astype(float)
+    X_nan[Xi_train == 1] = np.nan
+
+    draws = []
+    for _ in range(K):
+        mice_imputer.random_state_ = np.random.RandomState(rng.randint(0, 100000))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            draws.append(mice_imputer.transform(X_nan))
+    X_lof = np.mean(draws, axis=0)
+
+    lof = LocalOutlierFactor(n_neighbors=n_neighbors, novelty=True)
+    lof.fit(X_lof)
+
+    # score_samples returns negative LOF; negate to get the standard LOF value
+    lof_score = -lof.score_samples(x_rec.reshape(1, -1))[0]
+    return float(lof_score)
+
+
+def l2_proximity(x0, delta, xi0, r, mu):
+    """ℓ2 distance over post-action observed features only (xi_c == 0).
+
+    Still-missing features are excluded: their contribution would be
+    mu - 0 (imputed mean minus zero-fill), which reflects imputation
+    noise rather than anything the user changed.
     """
     x_rec, xi_c = _recourse_point(x0, delta, xi0, r, mu)
-    phi_rec     = build_phi(x_rec.reshape(1, -1), xi_c.reshape(1, -1))
-    phi_aug     = np.append(phi_rec[0], 1.0)
+    obs_idx = np.where(xi_c == 0)[0]
+    return float(np.linalg.norm((x_rec - x0)[obs_idx]))
 
-    L          = np.linalg.cholesky(hessian_matrix)
-    H_inv_sqrt = np.linalg.inv(L).T
-    H_inv_phi  = H_inv_sqrt @ (H_inv_sqrt.T @ phi_aug)
 
-    denom = np.sqrt(phi_aug @ H_inv_phi)
-    if denom < 1e-12:
-        return True, float(theta_hat @ phi_aug)
+def print_recourse_summary(x0, xi0, best_r, best_delta, col_means, col_stds, names,
+                           kappa=None, metrics=None):
+    """
+    Print a feature-level qualitative summary of a recourse recommendation
+    with values in original (unstandardized) units.
 
-    theta_adv  = theta_hat - np.sqrt(2 * epsilon) * H_inv_phi / denom
-    score_adv  = float(phi_aug @ theta_adv)
-    return bool(score_adv >= tau), score_adv
+    Columns:
+      Original    — pre-action observed value; '---' if missing
+      Miss        — whether the feature was missing before the action
+      Reveal      — whether the action reveals this feature
+      Post-Action — value after applying delta; '---' if still missing
+      Change      — numeric shift for observed edits; 'revealed' for newly revealed features
+    """
+    d    = len(x0)
+    xi_c = xi0 - best_r
+
+    sep = "-" * 80
+    print(sep)
+    print(f"{'Feature':<28} {'Original':>9} {'Miss':>5} {'Reveal':>7} {'Post-Action':>12} {'Change':>11}")
+    print(sep)
+
+    for j in range(d):
+        orig_str    = f"{x0[j]*col_stds[j]+col_means[j]:.2f}" if xi0[j] == 0 else "---"
+        missing_str = "yes" if xi0[j] == 1 else "no"
+        reveal_str  = "yes" if best_r[j] == 1 else "-"
+
+        if xi_c[j] == 0:                                        # observed after action
+            post_val = (x0[j] + best_delta[j]) * col_stds[j] + col_means[j]
+            post_str = f"{post_val:.2f}"
+            if xi0[j] == 0:                                     # was observed before too
+                change = best_delta[j] * col_stds[j]
+                change_str = f"{change:+.2f}" if abs(change) > 1e-3 else "-"
+            else:                                               # was missing, now revealed
+                change_str = "revealed"
+        else:                                                   # still missing after action
+            post_str   = "---"
+            change_str = "-"
+
+        print(f"{names[j]:<28} {orig_str:>9} {missing_str:>5} {reveal_str:>7} {post_str:>12} {change_str:>11}")
+
+    print(sep)
+
+    if metrics is not None:
+        if kappa is not None:
+            reveal_cost = float(kappa @ best_r)
+            edit_cost   = metrics["total_cost"] - reveal_cost
+            print(f"  cost             : total={metrics['total_cost']:.4f}  "
+                  f"reveal={reveal_cost:.4f}  edit={edit_cost:.4f}")
+        else:
+            print(f"  cost             : {metrics['total_cost']:.4f}")
+        print(f"  nominal validity : {metrics['nominal']}")
+        print(f"  retrain validity : {metrics['retrain']:.3f}")
+        print(f"  awp (sanity)     : {metrics['awp_sanity']}  lb={metrics['lb_sanity']:.4f}")
+        print(f"  awp (stress)     : {metrics['awp_stress']}  lb={metrics['lb_stress']:.4f}")
+        print(f"  lof plausibility : {metrics['lof']:.4f}  (1.0 = in-distribution)")
+    print()
 
 
 if __name__ == "__main__":
     from data        import load_diabetes, train_test_split
     from model       import compute_hessian, predict
-    from imputer     import fit_mice, get_imputation_params
+    from imputer     import fit_mice, calibrate_rho
     from beam_search import beam_search
 
     X, Xi, y, Phi, names, col_means, col_stds = load_diabetes()
@@ -116,35 +206,58 @@ if __name__ == "__main__":
         i for i in test_idx
         if predict(Phi[[i]], theta_hat)[0] == -1 and Xi[i].sum() > 0
     ]
-    person_idx = denied_with_missing[0]
-    x0, xi0    = X[person_idx], Xi[person_idx]
 
-    best_r, best_delta, best_cost, _ = beam_search(
-        x0, xi0, theta_hat, hessian_matrix, mice_imputer,
-        epsilon=0.001, rho=1.0, kappa=np.ones(len(x0)) * 0.5,
-        J_edit=list(range(len(x0))), verbose=False,
-    )
+    kappa   = np.ones(len(X[0])) * 0.5
+    n_cases = min(3, len(denied_with_missing))
 
-    if best_r is None:
-        print("no feasible recourse found")
-    else:
-        xi_c = xi0 - best_r
-        mu, Sigma, _ = get_imputation_params(mice_imputer, x0, xi_c, K=100)
+    for case_num, person_idx in enumerate(denied_with_missing[:n_cases]):
+        x0, xi0 = X[person_idx], Xi[person_idx]
+        missing_names = [names[j] for j in np.where(xi0 == 1)[0]]
+        print(f"\n{'='*80}")
+        print(f"Case {case_num+1}  (person {person_idx})  missing: {missing_names}")
+        print(f"{'='*80}")
 
-        rr  = random_retrain_validity(
+        best_r, best_delta, best_cost, _, best_mu, best_Sigma, best_draws, best_rho_opt = beam_search(
+            x0, xi0, theta_hat, hessian_matrix, mice_imputer,
+            epsilon=0.001, rho_coverage=0.90, kappa=kappa,
+            J_edit=list(range(len(x0))), verbose=False,
+        )
+
+        if best_r is None:
+            print("no feasible recourse found")
+            continue
+
+        rho_stress       = calibrate_rho(best_draws, best_mu, best_Sigma, 0.99)
+        mu, Sigma        = best_mu, best_Sigma
+        nom              = nominal_validity(theta_hat, x0, best_delta, xi0, best_r, mu)
+        rr               = model_retrain_validity(
             X[train_idx], Xi[train_idx], y[train_idx],
             x0, best_delta, xi0, best_r, mu, n_models=50,
         )
-        rd  = rashomon_dropout_validity(
-            theta_hat, x0, best_delta, xi0, best_r, mu,
-            dropout_rate=0.1, n_samples=200,
-        )
-        awp, score_adv = awp_validity(
+        awp_sanity, lb_sanity = awp_validity(
             theta_hat, hessian_matrix,
+            x0, best_delta, xi0, best_r, mu, Sigma,
+            epsilon_eval=0.001, rho_eval=best_rho_opt,
+        )
+        awp_stress, lb_stress = awp_validity(
+            theta_hat, hessian_matrix,
+            x0, best_delta, xi0, best_r, mu, Sigma,
+            epsilon_eval=0.01, rho_eval=rho_stress,
+        )
+        lof = lof_plausibility(
+            X[train_idx], Xi[train_idx], mice_imputer,
             x0, best_delta, xi0, best_r, mu,
-            epsilon=0.001,
         )
 
-        print(f"random retrain validity   : {rr:.3f}")
-        print(f"rashomon dropout validity : {rd:.3f}")
-        print(f"awp passes                : {awp}  (adversarial score={score_adv:.4f})")
+        metrics = {
+            "total_cost": best_cost,
+            "nominal":    nom,
+            "retrain":    rr,
+            "awp_sanity": awp_sanity, "lb_sanity": lb_sanity,
+            "awp_stress": awp_stress, "lb_stress": lb_stress,
+            "lof":        lof,
+        }
+        print_recourse_summary(
+            x0, xi0, best_r, best_delta, col_means, col_stds, names,
+            kappa=kappa, metrics=metrics,
+        )

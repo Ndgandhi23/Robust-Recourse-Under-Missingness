@@ -14,17 +14,25 @@ FEATURE_NAMES = [
     "Age",
 ]
 
-# zeros in these columns are physiologically impossible — treat as missing
+# zeros can only mean missingness in these columns
 _MISSING_ZERO_NAMES = {"Glucose", "BloodPressure", "SkinThickness", "Insulin", "BMI"}
+#col idx of missing_zero_names
 MISSING_ZERO_COLS = [i for i, n in enumerate(FEATURE_NAMES) if n in _MISSING_ZERO_NAMES]
+
+# features that cannot be changed by the individual
+_IMMUTABLE_NAMES = {"Pregnancies", "DiabetesPedigreeFunction", "Age"}
+IMMUTABLE_COLS   = [i for i, n in enumerate(FEATURE_NAMES) if n in _IMMUTABLE_NAMES]
+MUTABLE_COLS     = [i for i, n in enumerate(FEATURE_NAMES) if n not in _IMMUTABLE_NAMES]
 
 
 def load_diabetes():
+    #load the csv
     local_path = "diabetes.csv"
     if not os.path.exists(local_path):
         raise FileNotFoundError("run download_data.py first")
 
     df = pd.read_csv(local_path)
+    #build x and xi
     X_raw = df[FEATURE_NAMES].values.astype(float)
     n, d  = X_raw.shape
 
