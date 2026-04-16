@@ -7,7 +7,7 @@ set -e
 
 echo "=== Loading modules ==="
 module purge
-module load python/3.10
+module load python/3.8.2
 
 echo "=== Creating virtual environment ==="
 python -m venv ~/.venvs/recourse
@@ -25,4 +25,4 @@ python -c "from pipeline import load_diabetes; load_diabetes()"
 
 echo ""
 echo "=== Setup complete ==="
-echo "To activate later:  module load python/3.10 && source ~/.venvs/recourse/bin/activate"
+echo "To activate later:  module load python/3.8.2 && source ~/.venvs/recourse/bin/activate"

@@ -10,7 +10,7 @@
 #SBATCH --error=logs/eval_cv_%j.err
 
 module purge
-module load python/3.10
+module load python/3.8.2
 source ~/.venvs/recourse/bin/activate
 
 cd $SLURM_SUBMIT_DIR
