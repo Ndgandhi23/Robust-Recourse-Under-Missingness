@@ -1,6 +1,6 @@
 import numpy as np
-from imputer  import get_imputation_params, calibrate_rho
-from recourse import solve_delta
+from .imputer  import get_imputation_params, calibrate_rho
+from .recourse import solve_delta
 
 
 def beam_search(

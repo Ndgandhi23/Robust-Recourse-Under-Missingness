@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import pandas as pd
+from .data_utils import build_phi, train_test_split
 
 
 FEATURE_NAMES = [
@@ -24,10 +25,13 @@ _IMMUTABLE_NAMES = {"Pregnancies", "DiabetesPedigreeFunction", "Age"}
 IMMUTABLE_COLS   = [i for i, n in enumerate(FEATURE_NAMES) if n in _IMMUTABLE_NAMES]
 MUTABLE_COLS     = [i for i, n in enumerate(FEATURE_NAMES) if n not in _IMMUTABLE_NAMES]
 
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "data")
+CSV_PATH  = os.path.join(_DATA_DIR, "diabetes.csv")
+
 
 def load_diabetes():
     #load the csv
-    local_path = "diabetes.csv"
+    local_path = CSV_PATH
     if not os.path.exists(local_path):
         raise FileNotFoundError("run download_data.py first")
 
@@ -54,28 +58,16 @@ def load_diabetes():
         X_scaled[obs_mask, j] = (X_raw[obs_mask, j] - col_means[j]) / col_stds[j]
 
     X   = X_scaled
-    y   = np.where(df["Outcome"].values == 1, 1, -1)
+    y   = np.where(df["Outcome"].values == 1, -1, 1)  # -1 = diabetic (denied), 1 = not diabetic (approved)
     Phi = build_phi(X, Xi)
 
-    print(f"n={n}  d={d}  diabetic={( y==1).sum()}  not={( y==-1).sum()}")
+    print(f"n={n}  d={d}  not_diabetic={( y==1).sum()}  diabetic={( y==-1).sum()}")
     for j, name in enumerate(FEATURE_NAMES):
         pct = 100 * Xi[:, j].mean()
         if pct > 0:
             print(f"  {name:<30} {Xi[:,j].sum():3d} missing ({pct:.1f}%)")
 
     return X, Xi, y, Phi, FEATURE_NAMES, col_means, col_stds
-
-
-def build_phi(X, Xi):
-    # phi(x, xi) = [x, xi]  shape (n, 2d)
-    return np.hstack([X, Xi])
-
-
-def train_test_split(n, test_frac=0.2, seed=42):
-    rng = np.random.RandomState(seed)
-    idx = rng.permutation(n)
-    n_test = int(test_frac * n)
-    return idx[n_test:], idx[:n_test]
 
 
 if __name__ == "__main__":

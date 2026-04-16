@@ -1,9 +1,9 @@
 import warnings
 import numpy as np
 from sklearn.neighbors import LocalOutlierFactor
-from data    import build_phi
-from model   import train, score
-from recourse import compute_A_b, worst_case_lower_bound
+from .data_utils import build_phi
+from .model      import train, score
+from .recourse   import compute_A_b, worst_case_lower_bound
 
 def _recourse_point(x0, delta, xi0, r, mu):
     """Post-action feature vector with mu plugged into still-missing entries."""
@@ -22,32 +22,39 @@ def nominal_validity(theta_hat, x0, delta, xi0, r, mu, tau=0.0):
     return bool(score(phi_rec, theta_hat)[0] >= tau)
 
 
-def model_retrain_validity(
-    X_train, Xi_train, y_train,
-    x0, delta, xi0, r, mu,
-    tau=0.0, n_models=50, seed=0,
-):
-    """
-    Retrain on bootstrap samples n_models times. Returns fraction of
-    retrained models for which the recourse action achieves score >= tau.
-    """
+def train_bootstrap_models(X_train, Xi_train, y_train, n_models=50, seed=0):
+    """Train bootstrap-resampled models once. Returns list of theta vectors."""
     rng = np.random.RandomState(seed)
     n   = len(y_train)
+    models = []
+    for _ in range(n_models):
+        idx   = rng.choice(n, size=n, replace=True)
+        Phi_b = build_phi(X_train[idx], Xi_train[idx])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            theta_b, _ = train(Phi_b, y_train[idx])
+        models.append(theta_b)
+    return models
+
+
+def model_retrain_validity(
+    x0, delta, xi0, r, mu,
+    bootstrap_models, tau=0.0,
+):
+    """
+    Score the recourse point against pre-trained bootstrap models.
+    Returns fraction for which the recourse action achieves score >= tau.
+    """
     x_rec, xi_c = _recourse_point(x0, delta, xi0, r, mu)
     phi_rec     = build_phi(x_rec.reshape(1, -1), xi_c.reshape(1, -1))
 
     valid = 0
-    for _ in range(n_models):
-        idx    = rng.choice(n, size=n, replace=True)
-        Phi_b  = build_phi(X_train[idx], Xi_train[idx])
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            theta_b, _ = train(Phi_b, y_train[idx])
+    for theta_b in bootstrap_models:
         s = score(phi_rec, theta_b)[0]
         if np.isfinite(s) and s >= tau:
             valid += 1
 
-    return valid / n_models
+    return valid / len(bootstrap_models)
 
 
 
@@ -84,21 +91,8 @@ def awp_validity(
     return bool(lb >= tau), float(lb)
 
 
-def lof_plausibility(X_train, Xi_train, mice_imputer, x0, delta, xi0, r, mu,
-                     n_neighbors=20, K=20, seed=0):
-    """
-    Local Outlier Factor plausibility score for a recourse point.
-
-    Fits LOF on MICE-imputed training data (K draws averaged) so the training
-    distribution matches the convention used for x_rec (missing entries filled
-    with MICE conditional means).
-    Returns a value >= 1; scores close to 1 indicate the recourse point lies
-    in a realistic, high-density region. Larger values mean the point is an
-    outlier relative to the training distribution.
-    """
-    x_rec, _ = _recourse_point(x0, delta, xi0, r, mu)
-
-    # impute training data: K draws on the full matrix, then average
+def fit_lof(X_train, Xi_train, mice_imputer, n_neighbors=20, K=20, seed=0):
+    """Fit LOF on MICE-imputed training data once. Returns fitted LOF model."""
     rng   = np.random.RandomState(seed)
     X_nan = X_train.copy().astype(float)
     X_nan[Xi_train == 1] = np.nan
@@ -113,9 +107,17 @@ def lof_plausibility(X_train, Xi_train, mice_imputer, x0, delta, xi0, r, mu,
 
     lof = LocalOutlierFactor(n_neighbors=n_neighbors, novelty=True)
     lof.fit(X_lof)
+    return lof
 
-    # score_samples returns negative LOF; negate to get the standard LOF value
-    lof_score = -lof.score_samples(x_rec.reshape(1, -1))[0]
+
+def lof_plausibility(x0, delta, xi0, r, mu, lof_model):
+    """
+    Score a recourse point against a pre-fitted LOF model.
+    Returns a value >= 1; scores close to 1 indicate the recourse point lies
+    in a realistic, high-density region.
+    """
+    x_rec, _ = _recourse_point(x0, delta, xi0, r, mu)
+    lof_score = -lof_model.score_samples(x_rec.reshape(1, -1))[0]
     return float(lof_score)
 
 
@@ -129,6 +131,39 @@ def l2_proximity(x0, delta, xi0, r, mu):
     x_rec, xi_c = _recourse_point(x0, delta, xi0, r, mu)
     obs_idx = np.where(xi_c == 0)[0]
     return float(np.linalg.norm((x_rec - x0)[obs_idx]))
+
+
+def rashomon_distance(theta, theta_hat, hessian):
+    """(1/2)(θ − θ̂)ᵀ H (θ − θ̂) — how far a model sits from the ERM in the Rashomon ellipsoid."""
+    d = theta - theta_hat
+    return 0.5 * d @ hessian @ d
+
+
+def build_ellipsoid_evaluator(theta_hat, hessian, epsilon_target, n_models=50, seed=0):
+    """Sample n_models parameter vectors uniformly from the Rashomon ellipsoid."""
+    rng = np.random.RandomState(seed)
+    p   = len(theta_hat)
+    L_inv_T = np.linalg.inv(np.linalg.cholesky(hessian)).T  # H^{-1/2}
+
+    models = []
+    for _ in range(n_models):
+        v  = rng.randn(p)
+        v /= np.linalg.norm(v)                        # uniform direction
+        v *= rng.uniform(0, 1) ** (1.0 / p)           # uniform in ball
+        v *= np.sqrt(2 * epsilon_target)               # scale to ellipsoid radius
+        models.append(theta_hat + L_inv_T @ v)
+    return models
+
+
+def ensemble_robustness(x0, delta, xi0, r, mu, eval_models, tau=0.0):
+    """True iff recourse point is approved (score >= tau) by every model in the list."""
+    x_rec, xi_c = _recourse_point(x0, delta, xi0, r, mu)
+    phi_rec     = build_phi(x_rec.reshape(1, -1), xi_c.reshape(1, -1))
+    for theta_e in eval_models:
+        s = score(phi_rec, theta_e)[0]
+        if not (np.isfinite(s) and s >= tau):
+            return False
+    return True
 
 
 def print_recourse_summary(x0, xi0, best_r, best_delta, col_means, col_stds, names,
@@ -184,7 +219,6 @@ def print_recourse_summary(x0, xi0, best_r, best_delta, col_means, col_stds, nam
         print(f"  nominal validity : {metrics['nominal']}")
         print(f"  retrain validity : {metrics['retrain']:.3f}")
         print(f"  awp (sanity)     : {metrics['awp_sanity']}  lb={metrics['lb_sanity']:.4f}")
-        print(f"  awp (stress)     : {metrics['awp_stress']}  lb={metrics['lb_stress']:.4f}")
         print(f"  lof plausibility : {metrics['lof']:.4f}  (1.0 = in-distribution)")
     print()
 
@@ -210,6 +244,12 @@ if __name__ == "__main__":
     kappa   = np.ones(len(X[0])) * 0.5
     n_cases = min(3, len(denied_with_missing))
 
+    # precompute shared objects
+    bootstrap_models = train_bootstrap_models(
+        X[train_idx], Xi[train_idx], y[train_idx], n_models=50,
+    )
+    lof_model = fit_lof(X[train_idx], Xi[train_idx], mice_imputer)
+
     for case_num, person_idx in enumerate(denied_with_missing[:n_cases]):
         x0, xi0 = X[person_idx], Xi[person_idx]
         missing_names = [names[j] for j in np.where(xi0 == 1)[0]]
@@ -231,8 +271,7 @@ if __name__ == "__main__":
         mu, Sigma        = best_mu, best_Sigma
         nom              = nominal_validity(theta_hat, x0, best_delta, xi0, best_r, mu)
         rr               = model_retrain_validity(
-            X[train_idx], Xi[train_idx], y[train_idx],
-            x0, best_delta, xi0, best_r, mu, n_models=50,
+            x0, best_delta, xi0, best_r, mu, bootstrap_models,
         )
         awp_sanity, lb_sanity = awp_validity(
             theta_hat, hessian_matrix,
@@ -244,10 +283,7 @@ if __name__ == "__main__":
             x0, best_delta, xi0, best_r, mu, Sigma,
             epsilon_eval=0.01, rho_eval=rho_stress,
         )
-        lof = lof_plausibility(
-            X[train_idx], Xi[train_idx], mice_imputer,
-            x0, best_delta, xi0, best_r, mu,
-        )
+        lof = lof_plausibility(x0, best_delta, xi0, best_r, mu, lof_model)
 
         metrics = {
             "total_cost": best_cost,

@@ -2,7 +2,7 @@
 download_data.py
 ----------------
 Downloads the Pima Indians Diabetes dataset and saves it locally
-as 'diabetes.csv' in the same directory as this script.
+as 'data/diabetes.csv' relative to this script.
 
 Run this once before using the pipeline:
     python download_data.py
@@ -13,6 +13,8 @@ Citation: Smith et al., Pima Indians Diabetes Database, 1988.
 
 import urllib.request
 import os
+
+_DIR = os.path.dirname(os.path.abspath(__file__))
 
 URL = (
     "https://raw.githubusercontent.com/jbrownlee/Datasets/"
@@ -31,7 +33,7 @@ COLUMN_NAMES = [
     "Outcome",
 ]
 
-OUTPUT_FILE = "diabetes.csv"
+OUTPUT_FILE = os.path.join(_DIR, "data", "diabetes.csv")
 
 
 def download():
@@ -39,6 +41,7 @@ def download():
         print(f"'{OUTPUT_FILE}' already exists — skipping download.")
         return
 
+    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
     print(f"Downloading Pima Indians Diabetes dataset...")
     print(f"Source: {URL}")
 
@@ -61,7 +64,7 @@ def download():
         print(f"Download failed: {e}")
         print("You can manually download the dataset from:")
         print("  https://www.kaggle.com/datasets/uciml/pima-indians-diabetes-database")
-        print("and save it as 'diabetes.csv' in this directory.")
+        print("and save it as 'data/diabetes.csv' in this directory.")
 
 
 if __name__ == "__main__":
