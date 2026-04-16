@@ -18,6 +18,7 @@ import sys
 import time
 import argparse
 import multiprocessing as mp
+import pickle
 from functools import partial
 import numpy as np
 
@@ -134,10 +135,37 @@ def summarize_condition(results):
     }
 
 
+_PERSON_KEYS = ("idx", "feasible", "cost", "nom", "rr", "awp", "lb", "lof", "l2", "time")
+
+
+def _slim_results(raw):
+    """Keep only scalar per-person metrics (drop heavy arrays like delta/Sigma)."""
+    return [
+        {k: float(r[k]) if isinstance(r.get(k), (np.floating, np.integer)) else r[k]
+         for k in _PERSON_KEYS if k in r}
+        for r in raw
+    ]
+
+
 # ── hyperparameter tuning ──────────────────────────────────────────────
 
+def _tune_one_person(idx, X, Xi, theta_tmp, hessian_tmp, mice_tmp,
+                     kappa, J_edit, eps, rho_c, ref_models):
+    x0, xi0 = X[idx], Xi[idx]
+    r, delta, cost, _, mu, Sigma, _, rho_opt = beam_search(
+        x0, xi0, theta_tmp, hessian_tmp, mice_tmp,
+        epsilon=eps, rho_coverage=rho_c, kappa=kappa, J_edit=J_edit,
+        tau=0.0, beam_width=BEAM_WIDTH, K_max=K_MAX, K_mice=K_MICE,
+        x_min=x0 - DELTA_MAX, x_max=x0 + DELTA_MAX, verbose=False,
+    )
+    if r is None:
+        return (False, 0.0, False)
+    robust = ensemble_robustness(x0, delta, xi0, r, mu, ref_models)
+    return (True, cost, robust)
+
+
 def tune_hyperparams(X, Xi, y, Phi, inner_trn_idx, inner_val_idx, J_edit,
-                     fold_num):
+                     fold_num, n_workers=1):
     """
     Grid search (epsilon, rho_coverage) on validation set.
 
@@ -175,31 +203,40 @@ def tune_hyperparams(X, Xi, y, Phi, inner_trn_idx, inner_val_idx, J_edit,
     best_score = (-1, -1, float("inf"))
     best_eps, best_rho = 0.001, 0.90
 
-    for eps in EPSILON_GRID:
-        for rho_c in RHO_COV_GRID:
-            n_feas, n_robust, total_cost = 0, 0, 0.0
-
-            for idx in denied_val:
-                x0, xi0 = X[idx], Xi[idx]
-                r, delta, cost, _, mu, Sigma, _, rho_opt = beam_search(
-                    x0, xi0, theta_tmp, hessian_tmp, mice_tmp,
-                    epsilon=eps, rho_coverage=rho_c, kappa=kappa, J_edit=J_edit,
-                    tau=0.0, beam_width=BEAM_WIDTH, K_max=K_MAX, K_mice=K_MICE,
-                    x_min=x0 - DELTA_MAX, x_max=x0 + DELTA_MAX, verbose=False,
+    pool = mp.Pool(processes=n_workers) if n_workers > 1 else None
+    try:
+        for eps in EPSILON_GRID:
+            for rho_c in RHO_COV_GRID:
+                worker = partial(
+                    _tune_one_person,
+                    X=X, Xi=Xi, theta_tmp=theta_tmp, hessian_tmp=hessian_tmp,
+                    mice_tmp=mice_tmp, kappa=kappa, J_edit=J_edit,
+                    eps=eps, rho_c=rho_c, ref_models=ref_models,
                 )
-                if r is None:
-                    continue
-                n_feas += 1
-                total_cost += cost
-                if ensemble_robustness(x0, delta, xi0, r, mu, ref_models):
-                    n_robust += 1
 
-            n = len(denied_val)
-            score = (n_feas / n, n_robust / n, -total_cost / max(n_feas, 1))
+                if pool is not None:
+                    person_results = pool.map(worker, denied_val)
+                else:
+                    person_results = [worker(idx) for idx in denied_val]
 
-            if score > best_score:
-                best_score = score
-                best_eps, best_rho = eps, rho_c
+                n_feas, n_robust, total_cost = 0, 0, 0.0
+                for feasible, cost, robust in person_results:
+                    if feasible:
+                        n_feas += 1
+                        total_cost += cost
+                        if robust:
+                            n_robust += 1
+
+                n = len(denied_val)
+                score = (n_feas / n, n_robust / n, -total_cost / max(n_feas, 1))
+
+                if score > best_score:
+                    best_score = score
+                    best_eps, best_rho = eps, rho_c
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
 
     print(f"    tuning: best eps={best_eps:.4f}  rho={best_rho:.2f}  "
           f"(feas={best_score[0]:.2f} rob={best_score[1]:.2f})")
@@ -291,6 +328,7 @@ def run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit, n_workers=1):
     t_tune = time.time()
     best_eps, best_rho = tune_hyperparams(
         X, Xi, y, Phi, inner_trn_idx, inner_val_idx, J_edit, fold_num,
+        n_workers=n_workers,
     )
     print(f"    tuning time: {time.time() - t_tune:.1f}s")
 
@@ -345,6 +383,7 @@ def run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit, n_workers=1):
 
     fold_summaries = {}
     fold_raw       = {}
+    fold_persons   = {}
     fold_curves    = {}
 
     for label, eps, rho_c, k_max, rho_override in conditions:
@@ -355,6 +394,7 @@ def run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit, n_workers=1):
         summary = summarize_condition(raw)
         fold_summaries[label] = summary
         fold_raw[label] = raw
+        fold_persons[label] = _slim_results(raw)
 
         fold_curves[label] = {
             "retrain":   retrain_curve(raw, X, Xi, bootstrap_models,
@@ -376,6 +416,7 @@ def run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit, n_workers=1):
     return {
         "summaries": fold_summaries,
         "curves": fold_curves,
+        "raw": fold_persons,
         "best_eps": best_eps,
         "best_rho": best_rho,
     }
@@ -543,6 +584,16 @@ def main():
         return
 
     print_summary(all_folds)
+
+    # save results for figures.py
+    save_path = "results_cv.pkl"
+    with open(save_path, "wb") as f:
+        pickle.dump({
+            "folds": all_folds,
+            "etarget_grid": list(ETARGET_GRID),
+            "cond_labels": list(COND_LABELS),
+        }, f)
+    print(f"Results saved to {save_path}")
     print(f"total wall time: {time.time() - t_total:.0f}s")
 
 
