@@ -9,9 +9,8 @@
 #SBATCH --output=logs/eval_%j.out
 #SBATCH --error=logs/eval_%j.err
 
-module purge
-module load python/3.8.2
-source ~/.venvs/recourse/bin/activate
+eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
+conda activate base
 
 cd $SLURM_SUBMIT_DIR
 mkdir -p logs
