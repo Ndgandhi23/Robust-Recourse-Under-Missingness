@@ -13,11 +13,18 @@ def train_test_split(n, test_frac=0.2, seed=42):
     return idx[n_test:], idx[:n_test]
 
 
-def stratified_kfold(y, n_splits=4, seed=42):
-    """Yield (train_idx, test_idx) for each fold, preserving class balance."""
+def stratified_kfold(y, n_splits=4, seed=42, Xi=None):
+    """Yield (train_idx, test_idx) for each fold, preserving class balance.
+    If Xi is provided, also preserves the has-missing rate across folds
+    by stratifying on (class x has_missing)."""
     from sklearn.model_selection import StratifiedKFold
+    if Xi is not None:
+        has_missing = (Xi.sum(axis=1) > 0).astype(int)
+        strat_key = y * 10 + has_missing   # unique int per (class, missing) group
+    else:
+        strat_key = y
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    return list(skf.split(np.zeros(len(y)), y))
+    return list(skf.split(np.zeros(len(y)), strat_key))
 
 
 def stratified_train_val_split(y, val_frac=0.2, seed=42):
