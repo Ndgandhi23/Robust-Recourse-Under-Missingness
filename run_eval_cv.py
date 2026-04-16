@@ -16,6 +16,9 @@ Usage:
 
 import sys
 import time
+import argparse
+import multiprocessing as mp
+from functools import partial
 import numpy as np
 
 from pipeline import (
@@ -51,48 +54,64 @@ COND_LABELS         = ["ours", "baseline", "no-robust", "no-reveal"]
 
 # ── per-condition evaluation ────────────────────────────────────────────
 
+def _eval_one_person_cv(idx, X, Xi, theta_hat, hessian_matrix, mice_imputer,
+                        bootstrap_models, lof_model, kappa, J_edit,
+                        epsilon, rho_coverage, k_max, rho_override):
+    x0, xi0 = X[idx], Xi[idx]
+    x_min = x0 - DELTA_MAX
+    x_max = x0 + DELTA_MAX
+
+    t0 = time.time()
+    r, delta, cost, _, mu, Sigma, _, rho_opt = beam_search(
+        x0, xi0, theta_hat, hessian_matrix, mice_imputer,
+        epsilon=epsilon, rho_coverage=rho_coverage, kappa=kappa, J_edit=J_edit,
+        tau=0.0, beam_width=BEAM_WIDTH, K_max=k_max, K_mice=K_MICE,
+        x_min=x_min, x_max=x_max,
+        verbose=False, rho_override=rho_override,
+    )
+    elapsed = time.time() - t0
+
+    if r is None:
+        return {"idx": idx, "feasible": False, "time": elapsed}
+
+    nom = nominal_validity(theta_hat, x0, delta, xi0, r, mu)
+    rr  = model_retrain_validity(x0, delta, xi0, r, mu, bootstrap_models)
+    awp, lb = awp_validity(
+        theta_hat, hessian_matrix,
+        x0, delta, xi0, r, mu, Sigma,
+        epsilon_eval=epsilon, rho_eval=rho_opt,
+    )
+    lof = lof_plausibility(x0, delta, xi0, r, mu, lof_model)
+    l2  = l2_proximity(x0, delta, xi0, r, mu)
+
+    return {
+        "idx": idx, "feasible": True, "cost": cost,
+        "nom": nom, "rr": rr,
+        "awp": awp, "lb": lb,
+        "lof": lof, "l2": l2, "time": elapsed,
+        "delta": delta, "r": r, "mu": mu,
+        "Sigma": Sigma, "rho_opt": rho_opt,
+    }
+
+
 def run_condition(X, Xi, Phi, theta_hat, hessian_matrix, mice_imputer,
                   bootstrap_models, lof_model, kappa, J_edit,
                   denied_ids, epsilon, rho_coverage, label,
-                  k_max=K_MAX, rho_override=None):
-    results = []
-    for idx in denied_ids:
-        x0, xi0 = X[idx], Xi[idx]
-        x_min = x0 - DELTA_MAX
-        x_max = x0 + DELTA_MAX
+                  k_max=K_MAX, rho_override=None, n_workers=1):
+    worker = partial(
+        _eval_one_person_cv,
+        X=X, Xi=Xi, theta_hat=theta_hat, hessian_matrix=hessian_matrix,
+        mice_imputer=mice_imputer, bootstrap_models=bootstrap_models,
+        lof_model=lof_model, kappa=kappa, J_edit=J_edit,
+        epsilon=epsilon, rho_coverage=rho_coverage,
+        k_max=k_max, rho_override=rho_override,
+    )
 
-        t0 = time.time()
-        r, delta, cost, _, mu, Sigma, _, rho_opt = beam_search(
-            x0, xi0, theta_hat, hessian_matrix, mice_imputer,
-            epsilon=epsilon, rho_coverage=rho_coverage, kappa=kappa, J_edit=J_edit,
-            tau=0.0, beam_width=BEAM_WIDTH, K_max=k_max, K_mice=K_MICE,
-            x_min=x_min, x_max=x_max,
-            verbose=False, rho_override=rho_override,
-        )
-        elapsed = time.time() - t0
-
-        if r is None:
-            results.append({"idx": idx, "feasible": False, "time": elapsed})
-            continue
-
-        nom = nominal_validity(theta_hat, x0, delta, xi0, r, mu)
-        rr  = model_retrain_validity(x0, delta, xi0, r, mu, bootstrap_models)
-        awp, lb = awp_validity(
-            theta_hat, hessian_matrix,
-            x0, delta, xi0, r, mu, Sigma,
-            epsilon_eval=epsilon, rho_eval=rho_opt,
-        )
-        lof = lof_plausibility(x0, delta, xi0, r, mu, lof_model)
-        l2  = l2_proximity(x0, delta, xi0, r, mu)
-
-        results.append({
-            "idx": idx, "feasible": True, "cost": cost,
-            "nom": nom, "rr": rr,
-            "awp": awp, "lb": lb,
-            "lof": lof, "l2": l2, "time": elapsed,
-            "delta": delta, "r": r, "mu": mu,
-            "Sigma": Sigma, "rho_opt": rho_opt,
-        })
+    if n_workers > 1:
+        with mp.Pool(processes=n_workers) as pool:
+            results = pool.map(worker, denied_ids)
+    else:
+        results = [worker(idx) for idx in denied_ids]
 
     return results
 
@@ -254,7 +273,7 @@ def awp_curve(raw_results, X, Xi, theta_hat, hessian, etarget_grid):
 
 # ── single fold ─────────────────────────────────────────────────────────
 
-def run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit):
+def run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit, n_workers=1):
     print(f"\n{'='*70}")
     print(f"  FOLD {fold_num + 1}")
     print(f"{'='*70}")
@@ -331,7 +350,8 @@ def run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit):
     for label, eps, rho_c, k_max, rho_override in conditions:
         t0 = time.time()
         raw = run_condition(**shared, epsilon=eps, rho_coverage=rho_c, label=label,
-                            k_max=k_max, rho_override=rho_override)
+                            k_max=k_max, rho_override=rho_override,
+                            n_workers=n_workers)
         summary = summarize_condition(raw)
         fold_summaries[label] = summary
         fold_raw[label] = raw
@@ -469,18 +489,52 @@ def print_summary(all_folds):
 
 # ── main ────────────────────────────────────────────────────────────────
 
+def print_fold_diagnostics(X, Xi, y, Phi, names, folds):
+    """Print per-fold class balance and missingness rates."""
+    print(f"\n{'#' * 80}")
+    print(f"#  FOLD DIAGNOSTICS")
+    print(f"{'#' * 80}\n")
+
+    print(f"  Overall: n={len(y)}  "
+          f"not_diabetic(+1)={( y==1).sum()} ({100*(y==1).mean():.1f}%)  "
+          f"diabetic(-1)={( y==-1).sum()} ({100*(y==-1).mean():.1f}%)  "
+          f"any-missing={100*(Xi.sum(axis=1)>0).mean():.1f}%\n")
+
+    hdr = (f"  {'Fold':>4s}  {'Train':>5s}  {'Test':>5s}  "
+           f"{'Trn +1%':>7s}  {'Tst +1%':>7s}  "
+           f"{'Trn miss%':>9s}  {'Tst miss%':>9s}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+
+    for i, (train_idx, test_idx) in enumerate(folds):
+        y_trn, y_tst = y[train_idx], y[test_idx]
+        print(f"  {i+1:4d}  {len(train_idx):5d}  {len(test_idx):5d}  "
+              f"{100*(y_trn==1).mean():6.1f}%  {100*(y_tst==1).mean():6.1f}%  "
+              f"{100*(Xi[train_idx].sum(axis=1)>0).mean():8.1f}%  "
+              f"{100*(Xi[test_idx].sum(axis=1)>0).mean():8.1f}%")
+    print()
+
+
 def main():
+    parser = argparse.ArgumentParser(description="4-fold stratified CV evaluation")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel workers for per-person evaluation")
+    args = parser.parse_args()
+
     print("Loading diabetes dataset...")
     X, Xi, y, Phi, names, col_means, col_stds = load_diabetes()
     J_edit = DIABETES_MUTABLE
 
-    folds = stratified_kfold(y, n_splits=N_FOLDS, seed=42)
+    folds = stratified_kfold(y, n_splits=N_FOLDS, seed=42, Xi=Xi)
 
-    all_folds = []
+    print_fold_diagnostics(X, Xi, y, Phi, names, folds)
+
     t_total = time.time()
 
+    all_folds = []
     for fold_num, (train_idx, test_idx) in enumerate(folds):
-        fold_result = run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit)
+        fold_result = run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit,
+                               n_workers=args.workers)
         if fold_result is not None:
             all_folds.append(fold_result)
 

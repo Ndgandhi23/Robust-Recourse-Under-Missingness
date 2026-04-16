@@ -8,6 +8,9 @@ Usage:
 
 import sys
 import time
+import argparse
+import multiprocessing as mp
+from functools import partial
 import numpy as np
 
 from pipeline import (
@@ -42,50 +45,70 @@ DATASETS["diabetes"] = _load_diabetes
 
 
 # ── evaluation logic ─────────────────────────────────────────────────────────
+def _eval_one_person(idx, X, Xi, theta_hat, hessian_matrix, mice_imputer,
+                     bootstrap_models, lof_model, kappa, J_edit,
+                     epsilon, k_max, rho_override):
+    x0, xi0 = X[idx], Xi[idx]
+    x_min = x0 - DELTA_MAX
+    x_max = x0 + DELTA_MAX
+
+    t0 = time.time()
+    r, delta, cost, _, mu, Sigma, _, rho_opt = beam_search(
+        x0, xi0, theta_hat, hessian_matrix, mice_imputer,
+        epsilon=epsilon, rho_coverage=RHO_OPT_COVERAGE, kappa=kappa, J_edit=J_edit,
+        tau=0.0, beam_width=BEAM_WIDTH, K_max=k_max, K_mice=K_MICE,
+        x_min=x_min, x_max=x_max,
+        verbose=False, rho_override=rho_override,
+    )
+    elapsed = time.time() - t0
+
+    if r is None:
+        return {"idx": idx, "feasible": False, "time": elapsed}
+
+    nom = nominal_validity(theta_hat, x0, delta, xi0, r, mu)
+    rr  = model_retrain_validity(x0, delta, xi0, r, mu, bootstrap_models)
+    awp, lb = awp_validity(
+        theta_hat, hessian_matrix,
+        x0, delta, xi0, r, mu, Sigma,
+        epsilon_eval=EPSILON, rho_eval=rho_opt,
+    )
+    lof = lof_plausibility(x0, delta, xi0, r, mu, lof_model)
+    l2  = l2_proximity(x0, delta, xi0, r, mu)
+
+    return {
+        "idx": idx, "feasible": True, "cost": cost,
+        "nom": nom, "rr": rr,
+        "awp": awp, "lb": lb,
+        "lof": lof, "l2": l2, "time": elapsed,
+    }
+
+
 def run_condition(X, Xi, Phi, theta_hat, hessian_matrix, mice_imputer,
                   bootstrap_models, lof_model, kappa, J_edit,
-                  denied_ids, epsilon, label, k_max=K_MAX, rho_override=None):
-    results = []
-    for i, idx in enumerate(denied_ids):
-        x0, xi0 = X[idx], Xi[idx]
-        x_min   = x0 - DELTA_MAX
-        x_max   = x0 + DELTA_MAX
+                  denied_ids, epsilon, label, k_max=K_MAX, rho_override=None,
+                  n_workers=1):
+    worker = partial(
+        _eval_one_person,
+        X=X, Xi=Xi, theta_hat=theta_hat, hessian_matrix=hessian_matrix,
+        mice_imputer=mice_imputer, bootstrap_models=bootstrap_models,
+        lof_model=lof_model, kappa=kappa, J_edit=J_edit,
+        epsilon=epsilon, k_max=k_max, rho_override=rho_override,
+    )
 
-        t0 = time.time()
-        r, delta, cost, _, mu, Sigma, _, rho_opt = beam_search(
-            x0, xi0, theta_hat, hessian_matrix, mice_imputer,
-            epsilon=epsilon, rho_coverage=RHO_OPT_COVERAGE, kappa=kappa, J_edit=J_edit,
-            tau=0.0, beam_width=BEAM_WIDTH, K_max=k_max, K_mice=K_MICE,
-            x_min=x_min, x_max=x_max,
-            verbose=False, rho_override=rho_override,
-        )
-        elapsed = time.time() - t0
+    if n_workers > 1:
+        with mp.Pool(processes=n_workers) as pool:
+            results = pool.map(worker, denied_ids)
+    else:
+        results = [worker(idx) for idx in denied_ids]
 
-        if r is None:
-            results.append({"idx": idx, "feasible": False, "time": elapsed})
-            print(f"  [{label}] person {idx}: infeasible")
-            continue
-
-        nom  = nominal_validity(theta_hat, x0, delta, xi0, r, mu)
-        rr   = model_retrain_validity(x0, delta, xi0, r, mu, bootstrap_models)
-        awp, lb = awp_validity(
-            theta_hat, hessian_matrix,
-            x0, delta, xi0, r, mu, Sigma,
-            epsilon_eval=EPSILON, rho_eval=rho_opt,
-        )
-        lof = lof_plausibility(x0, delta, xi0, r, mu, lof_model)
-        l2  = l2_proximity(x0, delta, xi0, r, mu)
-
-        results.append({
-            "idx": idx, "feasible": True, "cost": cost,
-            "nom": nom, "rr": rr,
-            "awp": awp, "lb": lb,
-            "lof": lof, "l2": l2, "time": elapsed,
-        })
-        print(f"  [{label}] person {idx:5d}  cost={cost:.3f}  "
-              f"nom={nom}  rr={rr:.2f}  "
-              f"awp={awp}(rho={rho_opt:.2f})  "
-              f"lof={lof:.3f}  l2={l2:.3f}")
+    for r in results:
+        if r["feasible"]:
+            print(f"  [{label}] person {r['idx']:5d}  cost={r['cost']:.3f}  "
+                  f"nom={r['nom']}  rr={r['rr']:.2f}  "
+                  f"awp={r['awp']}(rho=-)  "
+                  f"lof={r['lof']:.3f}  l2={r['l2']:.3f}")
+        else:
+            print(f"  [{label}] person {r['idx']}: infeasible")
 
     return results
 
@@ -118,7 +141,7 @@ def summarize(results, label):
     )
 
 
-def run_dataset(name, loader):
+def run_dataset(name, loader, n_workers=1):
     print()
     print("#" * 70)
     print(f"#  DATASET: {name.upper()}")
@@ -172,6 +195,7 @@ def run_dataset(name, loader):
         all_results[label] = run_condition(
             **shared, epsilon=eps, label=label,
             k_max=k_max, rho_override=rho_override,
+            n_workers=n_workers,
         )
         print()
 
@@ -186,16 +210,21 @@ def run_dataset(name, loader):
 
 # ── main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    requested = sys.argv[1:] if len(sys.argv) > 1 else list(DATASETS.keys())
+    parser = argparse.ArgumentParser(description="Batch evaluation across datasets")
+    parser.add_argument("datasets", nargs="*", default=list(DATASETS.keys()),
+                        help="Datasets to evaluate (default: all)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel workers for per-person evaluation")
+    args = parser.parse_args()
 
-    for name in requested:
+    for name in args.datasets:
         if name not in DATASETS:
             print(f"unknown dataset: {name}")
             print(f"available: {', '.join(DATASETS.keys())}")
             sys.exit(1)
 
     t_total = time.time()
-    for name in requested:
-        run_dataset(name, DATASETS[name])
+    for name in args.datasets:
+        run_dataset(name, DATASETS[name], n_workers=args.workers)
 
     print(f"\ntotal wall time: {time.time() - t_total:.0f}s")
