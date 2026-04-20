@@ -17,13 +17,14 @@ Usage:
 import sys
 import time
 import argparse
+import pathlib
 import multiprocessing as mp
 import pickle
 from functools import partial
 import numpy as np
 
 from pipeline import (
-    load_diabetes, DIABETES_MUTABLE,
+    get_dataset, list_datasets,
     build_phi, train, compute_hessian, predict, accuracy,
     fit_mice, stratified_kfold, stratified_train_val_split,
     beam_search,
@@ -33,9 +34,8 @@ from pipeline import (
 )
 
 # ── fixed hyperparameters ───────────────────────────────────────────────
+# kappa (reveal cost) and delta_max (edit budget) are per-dataset — see DatasetConfig
 N_FOLDS             = 4
-KAPPA_VAL           = 0.5
-DELTA_MAX           = 2.0
 BEAM_WIDTH          = 3
 K_MAX               = 3
 K_MICE              = 100
@@ -57,10 +57,10 @@ COND_LABELS         = ["ours", "baseline", "no-robust", "no-reveal"]
 
 def _eval_one_person_cv(idx, X, Xi, theta_hat, hessian_matrix, mice_imputer,
                         bootstrap_models, lof_model, kappa, J_edit,
-                        epsilon, rho_coverage, k_max, rho_override):
+                        epsilon, rho_coverage, k_max, rho_override, delta_max):
     x0, xi0 = X[idx], Xi[idx]
-    x_min = x0 - DELTA_MAX
-    x_max = x0 + DELTA_MAX
+    x_min = x0 - delta_max
+    x_max = x0 + delta_max
 
     t0 = time.time()
     r, delta, cost, _, mu, Sigma, _, rho_opt = beam_search(
@@ -98,14 +98,14 @@ def _eval_one_person_cv(idx, X, Xi, theta_hat, hessian_matrix, mice_imputer,
 def run_condition(X, Xi, Phi, theta_hat, hessian_matrix, mice_imputer,
                   bootstrap_models, lof_model, kappa, J_edit,
                   denied_ids, epsilon, rho_coverage, label,
-                  k_max=K_MAX, rho_override=None, n_workers=1):
+                  k_max=K_MAX, rho_override=None, n_workers=1, delta_max=2.0):
     worker = partial(
         _eval_one_person_cv,
         X=X, Xi=Xi, theta_hat=theta_hat, hessian_matrix=hessian_matrix,
         mice_imputer=mice_imputer, bootstrap_models=bootstrap_models,
         lof_model=lof_model, kappa=kappa, J_edit=J_edit,
         epsilon=epsilon, rho_coverage=rho_coverage,
-        k_max=k_max, rho_override=rho_override,
+        k_max=k_max, rho_override=rho_override, delta_max=delta_max,
     )
 
     if n_workers > 1:
@@ -150,13 +150,13 @@ def _slim_results(raw):
 # ── hyperparameter tuning ──────────────────────────────────────────────
 
 def _tune_one_person(idx, X, Xi, theta_tmp, hessian_tmp, mice_tmp,
-                     kappa, J_edit, eps, rho_c, ref_models):
+                     kappa, J_edit, eps, rho_c, ref_models, delta_max):
     x0, xi0 = X[idx], Xi[idx]
     r, delta, cost, _, mu, Sigma, _, rho_opt = beam_search(
         x0, xi0, theta_tmp, hessian_tmp, mice_tmp,
         epsilon=eps, rho_coverage=rho_c, kappa=kappa, J_edit=J_edit,
         tau=0.0, beam_width=BEAM_WIDTH, K_max=K_MAX, K_mice=K_MICE,
-        x_min=x0 - DELTA_MAX, x_max=x0 + DELTA_MAX, verbose=False,
+        x_min=x0 - delta_max, x_max=x0 + delta_max, verbose=False,
     )
     if r is None:
         return (False, 0.0, False)
@@ -165,7 +165,7 @@ def _tune_one_person(idx, X, Xi, theta_tmp, hessian_tmp, mice_tmp,
 
 
 def tune_hyperparams(X, Xi, y, Phi, inner_trn_idx, inner_val_idx, J_edit,
-                     fold_num, n_workers=1):
+                     fold_num, n_workers=1, C=1.0, kappa_val=0.5, delta_max=2.0):
     """
     Grid search (epsilon, rho_coverage) on validation set.
 
@@ -178,10 +178,10 @@ def tune_hyperparams(X, Xi, y, Phi, inner_trn_idx, inner_val_idx, J_edit,
     X_trn, Xi_trn, y_trn = X[inner_trn_idx], Xi[inner_trn_idx], y[inner_trn_idx]
     Phi_trn = build_phi(X_trn, Xi_trn)
 
-    theta_tmp, _ = train(Phi_trn, y_trn)
+    theta_tmp, _ = train(Phi_trn, y_trn, C=C)
     hessian_tmp  = compute_hessian(Phi_trn, theta_tmp)
     mice_tmp     = fit_mice(X_trn, Xi_trn)
-    kappa        = np.ones(X.shape[1]) * KAPPA_VAL
+    kappa        = np.ones(X.shape[1]) * kappa_val
 
     # validation denied individuals with missing features
     denied_val = [
@@ -212,6 +212,7 @@ def tune_hyperparams(X, Xi, y, Phi, inner_trn_idx, inner_val_idx, J_edit,
                     X=X, Xi=Xi, theta_tmp=theta_tmp, hessian_tmp=hessian_tmp,
                     mice_tmp=mice_tmp, kappa=kappa, J_edit=J_edit,
                     eps=eps, rho_c=rho_c, ref_models=ref_models,
+                    delta_max=delta_max,
                 )
 
                 if pool is not None:
@@ -310,7 +311,8 @@ def awp_curve(raw_results, X, Xi, theta_hat, hessian, etarget_grid):
 
 # ── single fold ─────────────────────────────────────────────────────────
 
-def run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit, n_workers=1):
+def run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit,
+             n_workers=1, C=1.0, kappa_val=0.5, delta_max=2.0):
     print(f"\n{'='*70}")
     print(f"  FOLD {fold_num + 1}")
     print(f"{'='*70}")
@@ -328,7 +330,7 @@ def run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit, n_workers=1):
     t_tune = time.time()
     best_eps, best_rho = tune_hyperparams(
         X, Xi, y, Phi, inner_trn_idx, inner_val_idx, J_edit, fold_num,
-        n_workers=n_workers,
+        n_workers=n_workers, C=C, kappa_val=kappa_val, delta_max=delta_max,
     )
     print(f"    tuning time: {time.time() - t_tune:.1f}s")
 
@@ -337,10 +339,10 @@ def run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit, n_workers=1):
     Phi_train, y_train = Phi[train_idx], y[train_idx]
     Phi_test, y_test = Phi[test_idx], y[test_idx]
 
-    theta_hat, _ = train(Phi_train, y_train)
+    theta_hat, _ = train(Phi_train, y_train, C=C)
     hessian      = compute_hessian(Phi_train, theta_hat)
     mice_imputer = fit_mice(X_train, Xi_train)
-    kappa        = np.ones(X.shape[1]) * KAPPA_VAL
+    kappa        = np.ones(X.shape[1]) * kappa_val
 
     train_acc = accuracy(Phi_train, theta_hat, y_train)
     test_acc  = accuracy(Phi_test,  theta_hat, y_test)
@@ -357,7 +359,7 @@ def run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit, n_workers=1):
         return None
 
     t0 = time.time()
-    bootstrap_models = train_bootstrap_models(X_train, Xi_train, y_train, n_models=N_MODELS)
+    bootstrap_models = train_bootstrap_models(X_train, Xi_train, y_train, n_models=N_MODELS, C=C)
     lof_model        = fit_lof(X_train, Xi_train, mice_imputer)
     dists = [rashomon_distance(m, theta_hat, hessian) for m in bootstrap_models]
     print(f"    bootstrap + LOF: {time.time() - t0:.1f}s  "
@@ -390,7 +392,7 @@ def run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit, n_workers=1):
         t0 = time.time()
         raw = run_condition(**shared, epsilon=eps, rho_coverage=rho_c, label=label,
                             k_max=k_max, rho_override=rho_override,
-                            n_workers=n_workers)
+                            n_workers=n_workers, delta_max=delta_max)
         summary = summarize_condition(raw)
         fold_summaries[label] = summary
         fold_raw[label] = raw
@@ -430,12 +432,12 @@ def _fmt(vals):
     return f"{m:.3f}±{se:.3f}"
 
 
-def print_summary(all_folds):
+def print_summary(all_folds, dataset_name="DIABETES"):
     n_folds = len(all_folds)
     metrics = ["cost", "nom", "rr", "awp", "lof", "l2"]
 
     print(f"\n{'#' * 80}")
-    print(f"#  SUMMARY — DIABETES  ({n_folds} folds, mean ± SE)")
+    print(f"#  SUMMARY — {dataset_name.upper()}  ({n_folds} folds, mean ± SE)")
     print(f"{'#' * 80}")
 
     # ── tuned hyperparameters ───────────────────────────────────────────
@@ -530,15 +532,16 @@ def print_summary(all_folds):
 
 # ── main ────────────────────────────────────────────────────────────────
 
-def print_fold_diagnostics(X, Xi, y, Phi, names, folds):
+def print_fold_diagnostics(X, Xi, y, Phi, names, folds,
+                           pos_label="approved", neg_label="denied"):
     """Print per-fold class balance and missingness rates."""
     print(f"\n{'#' * 80}")
     print(f"#  FOLD DIAGNOSTICS")
     print(f"{'#' * 80}\n")
 
     print(f"  Overall: n={len(y)}  "
-          f"not_diabetic(+1)={( y==1).sum()} ({100*(y==1).mean():.1f}%)  "
-          f"diabetic(-1)={( y==-1).sum()} ({100*(y==-1).mean():.1f}%)  "
+          f"{pos_label}(+1)={(y==1).sum()} ({100*(y==1).mean():.1f}%)  "
+          f"{neg_label}(-1)={(y==-1).sum()} ({100*(y==-1).mean():.1f}%)  "
           f"any-missing={100*(Xi.sum(axis=1)>0).mean():.1f}%\n")
 
     hdr = (f"  {'Fold':>4s}  {'Train':>5s}  {'Test':>5s}  "
@@ -558,24 +561,32 @@ def print_fold_diagnostics(X, Xi, y, Phi, names, folds):
 
 def main():
     parser = argparse.ArgumentParser(description="4-fold stratified CV evaluation")
+    parser.add_argument("--dataset", type=str, default="diabetes",
+                        choices=list_datasets(),
+                        help="Dataset to evaluate (default: diabetes)")
     parser.add_argument("--workers", type=int, default=1,
                         help="Number of parallel workers for per-person evaluation")
     args = parser.parse_args()
 
-    print("Loading diabetes dataset...")
-    X, Xi, y, Phi, names, col_means, col_stds = load_diabetes()
-    J_edit = DIABETES_MUTABLE
+    cfg = get_dataset(args.dataset)
+    print(f"Loading {cfg.display_name} dataset...")
+    X, Xi, y, Phi, names, col_means, col_stds = cfg.load()
+    J_edit = cfg.mutable_cols
 
     folds = stratified_kfold(y, n_splits=N_FOLDS, seed=42, Xi=Xi)
 
-    print_fold_diagnostics(X, Xi, y, Phi, names, folds)
+    print_fold_diagnostics(X, Xi, y, Phi, names, folds,
+                           pos_label=cfg.positive_label,
+                           neg_label=cfg.negative_label)
 
     t_total = time.time()
 
     all_folds = []
     for fold_num, (train_idx, test_idx) in enumerate(folds):
         fold_result = run_fold(fold_num, X, Xi, y, Phi, train_idx, test_idx, J_edit,
-                               n_workers=args.workers)
+                               n_workers=args.workers, C=cfg.default_C,
+                               kappa_val=cfg.default_kappa,
+                               delta_max=cfg.default_delta_max)
         if fold_result is not None:
             all_folds.append(fold_result)
 
@@ -583,12 +594,16 @@ def main():
         print("No valid folds.")
         return
 
-    print_summary(all_folds)
+    print_summary(all_folds, dataset_name=cfg.display_name)
 
     # save results for figures.py
-    save_path = "results_cv.pkl"
+    save_dir = pathlib.Path("results") / cfg.name
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / "results_cv.pkl"
     with open(save_path, "wb") as f:
         pickle.dump({
+            "dataset": cfg.name,
+            "display_name": cfg.display_name,
             "folds": all_folds,
             "etarget_grid": list(ETARGET_GRID),
             "cond_labels": list(COND_LABELS),

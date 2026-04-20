@@ -1,7 +1,9 @@
 import os
+import urllib.request
 import numpy as np
 import pandas as pd
 from .data_utils import build_phi, train_test_split
+from .dataset_config import DatasetConfig
 
 
 FEATURE_NAMES = [
@@ -68,6 +70,41 @@ def load_diabetes():
             print(f"  {name:<30} {Xi[:,j].sum():3d} missing ({pct:.1f}%)")
 
     return X, Xi, y, Phi, FEATURE_NAMES, col_means, col_stds
+
+
+_URL = (
+    "https://raw.githubusercontent.com/jbrownlee/Datasets/"
+    "master/pima-indians-diabetes.data.csv"
+)
+_COLUMN_NAMES = FEATURE_NAMES + ["Outcome"]
+
+
+def download():
+    if os.path.exists(CSV_PATH):
+        print(f"  {CSV_PATH} already exists — skipping.")
+        return
+    os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
+    print(f"  downloading Pima Indians Diabetes dataset...")
+    urllib.request.urlretrieve(_URL, CSV_PATH)
+    with open(CSV_PATH, "r") as f:
+        data = f.read()
+    with open(CSV_PATH, "w") as f:
+        f.write(",".join(_COLUMN_NAMES) + "\n" + data)
+    print(f"  saved {CSV_PATH}")
+
+
+def get_config():
+    return DatasetConfig(
+        name="diabetes",
+        display_name="Diabetes",
+        feature_names=FEATURE_NAMES,
+        mutable_cols=MUTABLE_COLS,
+        immutable_cols=IMMUTABLE_COLS,
+        load=load_diabetes,
+        download=download,
+        positive_label="not diabetic",
+        negative_label="diabetic",
+    )
 
 
 if __name__ == "__main__":

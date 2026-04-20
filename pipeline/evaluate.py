@@ -22,7 +22,7 @@ def nominal_validity(theta_hat, x0, delta, xi0, r, mu, tau=0.0):
     return bool(score(phi_rec, theta_hat)[0] >= tau)
 
 
-def train_bootstrap_models(X_train, Xi_train, y_train, n_models=50, seed=0):
+def train_bootstrap_models(X_train, Xi_train, y_train, n_models=50, seed=0, C=1.0):
     """Train bootstrap-resampled models once. Returns list of theta vectors."""
     rng = np.random.RandomState(seed)
     n   = len(y_train)
@@ -32,7 +32,7 @@ def train_bootstrap_models(X_train, Xi_train, y_train, n_models=50, seed=0):
         Phi_b = build_phi(X_train[idx], Xi_train[idx])
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            theta_b, _ = train(Phi_b, y_train[idx])
+            theta_b, _ = train(Phi_b, y_train[idx], C=C)
         models.append(theta_b)
     return models
 

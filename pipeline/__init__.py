@@ -10,3 +10,5 @@ from .evaluate     import (
     rashomon_distance, build_ellipsoid_evaluator, ensemble_robustness,
     print_recourse_summary,
 )
+from .dataset_config import DatasetConfig
+from .datasets       import get_dataset, list_datasets
